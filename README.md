@@ -20,7 +20,8 @@ A professional-grade Python security script that uses computer vision to detect 
 Before running the script, ensure you have Python installed and your camera connected.
 
 * **Python 3.x**
-* **OpenCV Library:** ```bash
+* **OpenCV Library:**
+* ```bash
     pip install opencv-python
     ```
 
