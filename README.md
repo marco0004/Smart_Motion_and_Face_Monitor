@@ -32,3 +32,4 @@ Before running the script, ensure you have Python installed and your camera conn
    ```bash
    git clone [https://github.com/yourusername/smart-monitor.git](https://github.com/yourusername/smart-monitor.git)
    cd smart-monitor
+   ```
