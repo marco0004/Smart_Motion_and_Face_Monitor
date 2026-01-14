@@ -9,10 +9,10 @@ from threading import Thread
 # --- 1. CONFIGURATION ---
 CONFIG = {
     "headless": input("Run in Headless Mode? (y/n): ").lower() == 'y',
-    "min_contour_area": 5000,      # Minimum size of movement to trigger
-    "motion_cooldown": 3.0,        # Seconds between saves
-    "learning_rate": 0.05,         # How fast the background "absorbs" changes
-    "resolution": (1280, 720),
+    "min_contour_area": 5000,
+    "motion_cooldown": 2.0,
+    "learning_rate": 0.05,
+    "resolution": (640, 480),
     "folders": ["captured_motion", "captured_faces"]
 }
 
@@ -55,31 +55,39 @@ class VideoStream:
 
 # --- 3. UTILITY FUNCTIONS ---
 def get_hw_stats():
-    """Retrieves CPU and Temp data with error handling."""
     try:
-        cpu = f"CPU: {psutil.cpu_percent()}%"
+        cpu_usage = psutil.cpu_percent(interval=0.1)
+        cpu = f"CPU: {cpu_usage}%"
+
         temps = psutil.sensors_temperatures()
-        # Search for common temperature keys
         temp_val = "N/A"
         if temps:
-            for key in ['coretemp', 'cpu_thermal', 'acpitz']:
-                if key in temps:
+            for key in temps:
+                if temps[key]:
                     temp_val = f"{temps[key][0].current}°C"
                     break
+
         return cpu, f"TEMP: {temp_val}"
     except Exception:
         return "CPU: --%", "TEMP: N/A"
 
-def draw_overlay(img, text, pos, color=(0, 255, 0)):
+def draw_ui_element(img, text, pos, color=(0, 255, 0)):
+    """Draws a text element with a black background for readability."""
     font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness = 1
+    (w, h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     x, y = pos
-    cv2.putText(img, text, (x + 1, y + 1), font, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), font, 0.45, color, 1, cv2.LINE_AA)
+    # Ensure coordinates are integers for OpenCV
+    cv2.rectangle(img, (int(x - 5), int(y - h - 5)), (int(x + w + 5), int(y + 5)), (0, 0, 0), -1)
+    cv2.putText(img, text, (int(x), int(y)), font, font_scale, color, thickness, cv2.LINE_AA)
 
 # --- 4. MAIN EXECUTION ---
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 vs = VideoStream().start()
-time.sleep(2.0) # Warm up
+
+psutil.cpu_percent(interval=None)
+time.sleep(2.0)
 
 avg_background = None
 last_save = {"motion": 0, "face": 0}
@@ -91,17 +99,19 @@ print(f"Monitoring started. Headless: {CONFIG['headless']}")
 try:
     while True:
         frame = vs.read()
-        if frame is None: break
+        if frame is None:
+            continue
+
+        # Get frame dimensions for dynamic UI placement
+        # H is Height (Y-axis), W is Width (X-axis)
+        (H, W) = frame.shape[:2]
 
         current_time = time.time()
-        display_frame = frame.copy() if not CONFIG["headless"] else None
-        
-        # HW Stats Update (Every 2 seconds)
+
         if current_time - last_hw_check > 2.0:
             cpu_str, temp_str = get_hw_stats()
             last_hw_check = current_time
 
-        # Image Processing
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
 
@@ -109,14 +119,12 @@ try:
             avg_background = gray_blurred.copy().astype("float")
             continue
 
-        # Motion Detection Logic
         cv2.accumulateWeighted(gray_blurred, avg_background, CONFIG["learning_rate"])
         diff = cv2.absdiff(gray_blurred, cv2.convertScaleAbs(avg_background))
         thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)[1]
         thresh = cv2.dilate(thresh, None, iterations=2)
-        
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+
         motion_detected = False
         active_boxes = []
         for c in contours:
@@ -124,31 +132,50 @@ try:
                 motion_detected = True
                 active_boxes.append(cv2.boundingRect(c))
 
-        # Face Detection (Only if motion exists to save CPU)
         faces = []
         if motion_detected:
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-        # File Saving Logic
         file_ts = time.strftime('%Y%m%d_%H%M%S')
-        if motion_detected and (current_time - last_save["motion"] > CONFIG["motion_cooldown"]):
-            cv2.imwrite(f"captured_motion/motion_{file_ts}.jpg", frame)
-            last_save["motion"] = current_time
-            logging.info("Motion detected and saved.")
+        readable_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        status_msg = "IDLE"
 
-        if len(faces) > 0 and (current_time - last_save["face"] > CONFIG["motion_cooldown"]):
-            cv2.imwrite(f"captured_faces/face_{file_ts}.jpg", frame)
-            last_save["face"] = current_time
-            logging.info(f"Face detected: {len(faces)} found.")
+        # --- DYNAMIC UI POSITIONS ---
+        # Calculate Y positions based on height (H)
+        pos_timestamp = (20, H - 20)  # 20 pixels from bottom
+        pos_status = (20, H - 45)     # 45 pixels from bottom
+        pos_tag = (20, H - 70)        # 70 pixels from bottom
+
+        if motion_detected or len(faces) > 0:
+            save_frame = frame.copy()
+            # Draw timestamp on saved files dynamically
+            draw_ui_element(save_frame, readable_ts, pos_timestamp, (255, 255, 255))
+
+            if motion_detected:
+                status_msg = "MOTION DETECTED"
+                if (current_time - last_save["motion"] > CONFIG["motion_cooldown"]):
+                    cv2.imwrite(f"captured_motion/motion_{file_ts}.jpg", save_frame)
+                    last_save["motion"] = current_time
+                    logging.info("Motion detected and saved.")
+
+            if len(faces) > 0:
+                status_msg = "FACE DETECTED"
+                if (current_time - last_save["face"] > CONFIG["motion_cooldown"]):
+                    draw_ui_element(save_frame, "FACE CAPTURE", pos_tag, (0, 255, 255))
+                    cv2.imwrite(f"captured_faces/face_{file_ts}.jpg", save_frame)
+                    last_save["face"] = current_time
+                    logging.info(f"Face detected: {len(faces)} found.")
 
         # Visuals (Skip if headless)
         if not CONFIG["headless"]:
-            # Draw UI
-            draw_overlay(display_frame, time.strftime("%Y-%m-%d %H:%M:%S"), (15, 700), (0, 255, 255))
-            draw_overlay(display_frame, cpu_str, (15, 30), (0, 255, 0))
-            draw_overlay(display_frame, temp_str, (15, 50), (0, 255, 0))
-            
-            # Draw Detectors
+            display_frame = frame.copy()
+            draw_ui_element(display_frame, cpu_str, (20, 30), (0, 255, 0))
+            draw_ui_element(display_frame, temp_str, (20, 55), (0, 255, 0))
+
+            status_color = (0, 0, 255) if motion_detected else (0, 255, 0)
+            draw_ui_element(display_frame, f"STATUS: {status_msg}", pos_status, status_color)
+            draw_ui_element(display_frame, readable_ts, pos_timestamp, (255, 255, 255))
+
             for (x, y, w, h) in active_boxes:
                 cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
             for (x, y, w, h) in faces:
