@@ -4,84 +4,104 @@ import os
 import logging
 import numpy as np
 import psutil
+from threading import Thread
 
-# --- 1. CONFIGURATION & SETUP ---
-mode = input("Run in Headless Mode? (y/n): ").lower()
-headless = True if mode == 'y' else False
+# --- 1. CONFIGURATION ---
+CONFIG = {
+    "headless": input("Run in Headless Mode? (y/n): ").lower() == 'y',
+    "min_contour_area": 5000,      # Minimum size of movement to trigger
+    "motion_cooldown": 3.0,        # Seconds between saves
+    "learning_rate": 0.05,         # How fast the background "absorbs" changes
+    "resolution": (1280, 720),
+    "folders": ["captured_motion", "captured_faces"]
+}
 
-folders = ["captured_motion", "captured_faces"]
-for folder in folders:
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+# Setup Folders
+for folder in CONFIG["folders"]:
+    os.makedirs(folder, exist_ok=True)
 
+# Logging Setup
 logging.basicConfig(
-    filename='activity_log.txt',
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    filename='activity_log.txt', level=logging.INFO,
+    format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-face_xml = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-face_cascade = cv2.CascadeClassifier(face_xml)
+# --- 2. MULTI-THREADED CAMERA CLASS ---
+class VideoStream:
+    def __init__(self, src=0):
+        self.stream = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["resolution"][0])
+        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["resolution"][1])
+        (self.grabbed, self.frame) = self.stream.read()
+        self.stopped = False
 
-# Camera Setup
-video = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-video.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-video.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    def start(self):
+        Thread(target=self.update, args=(), daemon=True).start()
+        return self
 
-# --- WINDOW RESIZE SETUP ---
-if not headless:
-    cv2.namedWindow("Smart Monitor", cv2.WINDOW_NORMAL) # Allows manual resizing
-    cv2.resizeWindow("Smart Monitor", 960, 540)        # Initial "comfortable" view size
+    def update(self):
+        while not self.stopped:
+            if not self.grabbed:
+                self.stop()
+            else:
+                (self.grabbed, self.frame) = self.stream.read()
 
-print("Initializing camera...")
-time.sleep(2)
+    def read(self):
+        return self.frame
 
-avg_background = None
-last_motion_save = 0
-last_face_save = 0
-last_hw_check = 0
-hw_check_interval = 2.0
-cooldown = 3
-font = cv2.FONT_HERSHEY_SIMPLEX
-cpu_str, temp_str = "CPU: --%", "TEMP: --C"
+    def stop(self):
+        self.stopped = True
+        self.stream.release()
 
+# --- 3. UTILITY FUNCTIONS ---
 def get_hw_stats():
+    """Retrieves CPU and Temp data with error handling."""
     try:
-        cpu_usage = psutil.cpu_percent()
-        temp = "N/A"
+        cpu = f"CPU: {psutil.cpu_percent()}%"
         temps = psutil.sensors_temperatures()
+        # Search for common temperature keys
+        temp_val = "N/A"
         if temps:
-            for name, entries in temps.items():
-                temp = f"{entries[0].current}C"
-                break
-        return f"CPU: {cpu_usage}%", f"TEMP: {temp}"
-    except:
-        return f"CPU: {psutil.cpu_percent()}%", "TEMP: N/A"
+            for key in ['coretemp', 'cpu_thermal', 'acpitz']:
+                if key in temps:
+                    temp_val = f"{temps[key][0].current}°C"
+                    break
+        return cpu, f"TEMP: {temp_val}"
+    except Exception:
+        return "CPU: --%", "TEMP: N/A"
 
-def draw_styled_text(img, text, pos, color=(0, 255, 0)):
+def draw_overlay(img, text, pos, color=(0, 255, 0)):
+    font = cv2.FONT_HERSHEY_SIMPLEX
     x, y = pos
     cv2.putText(img, text, (x + 1, y + 1), font, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
     cv2.putText(img, text, (x, y), font, 0.45, color, 1, cv2.LINE_AA)
 
+# --- 4. MAIN EXECUTION ---
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+vs = VideoStream().start()
+time.sleep(2.0) # Warm up
+
+avg_background = None
+last_save = {"motion": 0, "face": 0}
+last_hw_check = 0
+cpu_str, temp_str = "CPU: --%", "TEMP: --C"
+
+print(f"Monitoring started. Headless: {CONFIG['headless']}")
+
 try:
     while True:
-        check, frame = video.read()
-        if not check: break
+        frame = vs.read()
+        if frame is None: break
 
         current_time = time.time()
-
-        if current_time - last_hw_check > hw_check_interval:
+        display_frame = frame.copy() if not CONFIG["headless"] else None
+        
+        # HW Stats Update (Every 2 seconds)
+        if current_time - last_hw_check > 2.0:
             cpu_str, temp_str = get_hw_stats()
             last_hw_check = current_time
 
-        # TIMESTAMP (on high-res frame)
-        ts_text = time.strftime("%Y-%m-%d %H:%M:%S")
-        ts_pos = (15, frame.shape[0] - 15)
-        draw_styled_text(frame, ts_text, ts_pos, color=(0, 255, 255))
-
-        # 2. PROCESSING
-        display_frame = frame.copy()
+        # Image Processing
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray_blurred = cv2.GaussianBlur(gray, (21, 21), 0)
 
@@ -89,55 +109,57 @@ try:
             avg_background = gray_blurred.copy().astype("float")
             continue
 
-        cv2.accumulateWeighted(gray_blurred, avg_background, 0.1)
-        background_delta = cv2.absdiff(gray_blurred, cv2.convertScaleAbs(avg_background))
-        thresh = cv2.threshold(background_delta, 25, 255, cv2.THRESH_BINARY)[1]
+        # Motion Detection Logic
+        cv2.accumulateWeighted(gray_blurred, avg_background, CONFIG["learning_rate"])
+        diff = cv2.absdiff(gray_blurred, cv2.convertScaleAbs(avg_background))
+        thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)[1]
         thresh = cv2.dilate(thresh, None, iterations=2)
-        contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        motion_detected = False
+        active_boxes = []
+        for c in contours:
+            if cv2.contourArea(c) > CONFIG["min_contour_area"]:
+                motion_detected = True
+                active_boxes.append(cv2.boundingRect(c))
 
-        # 3. DETECTION
-        motion_this_frame = False
-        motion_boxes = []
-        for contour in contours:
-            if cv2.contourArea(contour) < 5000: continue
-            motion_this_frame = True
-            motion_boxes.append(cv2.boundingRect(contour))
-
+        # Face Detection (Only if motion exists to save CPU)
         faces = []
-        if motion_this_frame:
+        if motion_detected:
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-        # 4. SAVING
-        file_ts = time.strftime('%H%M%S')
-        if motion_this_frame and (current_time - last_motion_save > cooldown):
-            cv2.imwrite(os.path.join("captured_motion", f"motion_{file_ts}.jpg"), frame)
-            last_motion_save = current_time
+        # File Saving Logic
+        file_ts = time.strftime('%Y%m%d_%H%M%S')
+        if motion_detected and (current_time - last_save["motion"] > CONFIG["motion_cooldown"]):
+            cv2.imwrite(f"captured_motion/motion_{file_ts}.jpg", frame)
+            last_save["motion"] = current_time
+            logging.info("Motion detected and saved.")
 
-        if len(faces) > 0 and (current_time - last_face_save > cooldown):
-            cv2.imwrite(os.path.join("captured_faces", f"face_{file_ts}.jpg"), frame)
-            last_face_save = current_time
+        if len(faces) > 0 and (current_time - last_save["face"] > CONFIG["motion_cooldown"]):
+            cv2.imwrite(f"captured_faces/face_{file_ts}.jpg", frame)
+            last_save["face"] = current_time
+            logging.info(f"Face detected: {len(faces)} found.")
 
-        # 5. SHOW FEED
-        if not headless:
-            # Overlays
-            stats_rows = [cpu_str, temp_str, f"RES: {frame.shape[1]}x{frame.shape[0]}"]
-            for i, text in enumerate(stats_rows):
-                y_pos = 25 + (i * 20)
-                draw_styled_text(display_frame, text, (15, y_pos), color=(0, 255, 0))
-
-            for (x, y, w, h) in motion_boxes:
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        # Visuals (Skip if headless)
+        if not CONFIG["headless"]:
+            # Draw UI
+            draw_overlay(display_frame, time.strftime("%Y-%m-%d %H:%M:%S"), (15, 700), (0, 255, 255))
+            draw_overlay(display_frame, cpu_str, (15, 30), (0, 255, 0))
+            draw_overlay(display_frame, temp_str, (15, 50), (0, 255, 0))
+            
+            # Draw Detectors
+            for (x, y, w, h) in active_boxes:
+                cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
             for (x, y, w, h) in faces:
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                cv2.rectangle(display_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
 
-            # Displaying the frame in the named window
             cv2.imshow("Smart Monitor", display_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-        else:
-            time.sleep(0.01)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
 except KeyboardInterrupt:
-    print("\nStopping...")
+    print("\nManual Exit.")
 finally:
-    video.release()
+    vs.stop()
     cv2.destroyAllWindows()
